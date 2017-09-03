@@ -173,7 +173,10 @@ public class Benchmark {
         float upserthitratio = (float)0.20;
 
         @Option(desc = "Allow disabling different threads for testing specific functionality. ")
-        String disabledthreads = "none";
+       //String disabledthreads = "none";
+        String disabledthreads = "partBiglt,replBiglt,partTrunclt,replTrunclt,partCappedlt,replCappedlt,partLoadlt,replLoadlt,readThread,adHocMayhemThread,idpt,updateclasses";
+        //threads: "clients,partBiglt,replBiglt,partTrunclt,replTrunclt,partCappedlt,replCappedlt,partLoadlt,replLoadlt,readThread,adHocMayhemThread,idpt,updateclasses";
+        // Biglt,Trunclt,Cappedlt,Loadlt are also recognized and apply to BOTH part and repl threads
         ArrayList<String> disabledThreads = null;
 
         @Option(desc = "Enable topology awareness")

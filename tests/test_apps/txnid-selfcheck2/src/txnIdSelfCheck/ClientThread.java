@@ -49,14 +49,15 @@ public class ClientThread extends BenchmarkThread {
          * across client process lifetimes.
          */
         static Type typeFromId(float mpRatio, boolean allowInProcAdhoc) {
-            if (rn.nextDouble() < mpRatio) {
-                int r = rn.nextInt(19);
-                if (allowInProcAdhoc && (r < 1)) return ADHOC_MP;  // 0% or ~5% of MP workload
-                if (r < 7) return PARTITIONED_MP;                  // ~33% or 38%
-                if (r < 13) return REPLICATED;                     // ~33%
-                if (r < 19) return HYBRID;                         // ~33%
-            }
-            return PARTITIONED_SP;
+//            if (rn.nextDouble() < mpRatio) {
+//                int r = rn.nextInt(19);
+//                if (allowInProcAdhoc && (r < 1)) return ADHOC_MP;  // 0% or ~5% of MP workload
+//                if (r < 7) return PARTITIONED_MP;                  // ~33% or 38%
+//                if (r < 13) return REPLICATED;                     // ~33%
+//                if (r < 19) return HYBRID;                         // ~33%
+//            }
+//            //return PARTITIONED_SP;
+            return ADHOC_MP;
         }
     }
 
