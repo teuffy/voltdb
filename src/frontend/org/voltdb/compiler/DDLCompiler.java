@@ -67,7 +67,6 @@ import org.voltdb.compiler.statements.DropFunction;
 import org.voltdb.compiler.statements.DropProcedure;
 import org.voltdb.compiler.statements.DropRole;
 import org.voltdb.compiler.statements.DropStream;
-import org.voltdb.compiler.statements.ImportClass;
 import org.voltdb.compiler.statements.PartitionStatement;
 import org.voltdb.compiler.statements.ReplicateTable;
 import org.voltdb.compiler.statements.SetGlobalParam;
@@ -88,6 +87,7 @@ import org.voltdb.types.IndexType;
 import org.voltdb.utils.BuildDirectoryUtils;
 import org.voltdb.utils.CatalogSchemaTools;
 import org.voltdb.utils.CatalogUtil;
+import org.voltdb.utils.CompressionService;
 import org.voltdb.utils.Encoder;
 import org.voltdb.utils.LineReaderAdapter;
 import org.voltdb.utils.SQLCommand;
@@ -197,7 +197,6 @@ public class DDLCompiler {
                                 .addNextProcessor(new DropProcedure(this))
                                 .addNextProcessor(new PartitionStatement(this))
                                 .addNextProcessor(new ReplicateTable(this))
-                                .addNextProcessor(new ImportClass(this))
                                 .addNextProcessor(new CreateRole(this))
                                 .addNextProcessor(new DropRole(this))
                                 .addNextProcessor(new DropStream(this))
@@ -657,12 +656,6 @@ public class DDLCompiler {
         }
     }
 
-    public static class CreateProcedurePartitionData {
-        String tableName = null;
-        String columnName = null;
-        String parameterNo = null;
-    }
-
     private void checkValidPartitionTableIndex(Index index, Column partitionCol, String tableName)
             throws VoltCompilerException {
         // skip checking for non-unique indexes.
@@ -802,7 +795,7 @@ public class DDLCompiler {
 
     void compileToCatalog(Database db, boolean isXDCR) throws VoltCompilerException {
         // note this will need to be decompressed to be used
-        String binDDL = Encoder.compressAndBase64Encode(m_fullDDL);
+        String binDDL = CompressionService.compressAndBase64Encode(m_fullDDL);
         db.setSchema(binDDL);
 
         // output the xml catalog to disk
@@ -864,8 +857,52 @@ public class DDLCompiler {
     private static int kStateReadingEndCodeBlockDelim = 10 ;      // dealing with ending code block delimiter ###
     private static int kStateReadingEndCodeBlockNextDelim = 11;   // dealing with ending code block delimiter ###
 
+    // To indicate if inside multi statement procedure
+    private static boolean inBegin = false;
+    // To indicate if inside CASE .. WHEN .. END
+    private static int inCase = 0;
+    // BEGIN should follow AS for create procedure
+    // added this case since 'begin' can be table or column name
+    private static boolean checkForNextBegin = false;
+    // inBegin and checkForNextBegin are not k-state values since we cannot have BEGIN within a BEGIN
+    // also we check for next BEGIN only after AS. If the next token after AS is not BEGIN,
+    // then we need not store the state (i.e, checkForNextBegin)
 
     private static int readingState(char[] nchar, DDLStatement retval) {
+
+        if (!Character.isLetterOrDigit(nchar[0])) {
+            char prev = prevChar(retval.statement);
+            /* since we only have access to the current character and the characters we have seen so far,
+             * we can check for the token only after its completed and then look if it matches the required token
+             */
+            if (checkForNextBegin) {
+                if (prev == 'n' || prev == 'N') {
+                    if( checkForNextBegin && SQLLexer.matchToken(retval.statement, retval.statement.length() - 5, "begin") ) {
+                        inBegin = true;
+                    }
+                }
+                checkForNextBegin = false;
+            }
+            if (prev == 'd' || prev == 'D') {
+                if( SQLLexer.matchToken(retval.statement, retval.statement.length() - 3, "end") ) {
+                    if (inCase > 0) {
+                        inCase--;
+                    } else {
+                        // we can terminate BEGIN ... END for multi stmt proc
+                        // after all CASE ... END stmts are completed
+                        inBegin = false;
+                    }
+                }
+            } else if (prev == 'e' || prev == 'E') {
+                if( SQLLexer.matchToken(retval.statement, retval.statement.length() - 4, "case") ) {
+                    inCase++;
+                }
+            } else if (prev == 's' || prev == 'S') {
+                if( SQLLexer.matchToken(retval.statement, retval.statement.length() - 2, "as") ) {
+                    checkForNextBegin = true;
+                }
+            }
+        }
         if (nchar[0] == '-') {
             // remember that a possible '--' is being examined
             return kStateReadingCommentDelim;
@@ -881,7 +918,9 @@ public class DDLCompiler {
         else if (nchar[0] == ';') {
             // end of the statement
             retval.statement += nchar[0];
-            return kStateCompleteStatement;
+            // statement completed only if outside of begin..end
+            if(!inBegin)
+                return kStateCompleteStatement;
         }
         else if (nchar[0] == '\'') {
             retval.statement += nchar[0];
@@ -898,6 +937,10 @@ public class DDLCompiler {
         }
 
         return kStateReading;
+    }
+
+    private static char prevChar(String str) {
+        return str.charAt(str.length() - 1);
     }
 
     private static int readingCodeBlockStateDelim(char [] nchar, DDLStatement retval) {
@@ -1065,10 +1108,14 @@ public class DDLCompiler {
             // Set the line number to the start of the real statement.
             retval.lineNo = currLineNo;
             retval.endLineNo = currLineNo;
+            inBegin = false;
+            inCase = 0;
+            checkForNextBegin = false;
 
             while (state != kStateCompleteStatement) {
                 if (reader.read(nchar) == -1) {
-                    String msg = "Schema file ended mid-statement (no semicolon found).";
+                    // might be useful for the users for debugging if we include the statement which caused the error
+                    String msg = "Schema file ended mid-statement (no semicolon found) for statment: " + retval.statement;
                     throw compiler.new VoltCompilerException(msg, retval.lineNo);
                 }
 

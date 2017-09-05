@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.CompletableFuture;
+
 import org.hsqldb_voltpatches.HSQLInterface;
 import org.voltcore.logging.VoltLogger;
 import org.voltdb.ProcInfo;
@@ -50,6 +51,7 @@ import org.voltdb.compiler.VoltCompiler.VoltCompilerException;
 import org.voltdb.compilereport.ProcedureAnnotation;
 import org.voltdb.expressions.AbstractExpression;
 import org.voltdb.expressions.ParameterValueExpression;
+import org.voltdb.parser.SQLLexer;
 import org.voltdb.planner.StatementPartitioning;
 import org.voltdb.types.QueryType;
 import org.voltdb.utils.CatalogUtil;
@@ -177,11 +179,24 @@ public abstract class ProcedureCompiler {
             String className, ProcedureAnnotation pa, Class<?> procClass) throws VoltCompilerException {
         // check if partition info was set in ddl
         ProcInfoData ddlInfo = null;
-        if (ddlPartitionString != null && ! ddlPartitionString.trim().isEmpty()) {
+
+        String[] partitionInfoParts = new String[0];
+        if (ddlPartitionString != null) {
+            partitionInfoParts = ddlPartitionString.split(",");
+        }
+
+        if (partitionInfoParts.length == 1) {
             ddlInfo = new ProcInfoData();
             ddlInfo.partitionInfo = ddlPartitionString;
             ddlInfo.singlePartition = true;
         }
+        if (partitionInfoParts.length == 2) {
+            ddlInfo = new ProcInfoData();
+            ddlInfo.partitionInfo = ddlPartitionString;
+            ddlInfo.singlePartition = false;
+        }
+
+
         String shortName = deriveShortProcedureName(className);
 
         // get the annotation
@@ -213,12 +228,20 @@ public abstract class ProcedureCompiler {
         }
         assert(info != null);
 
-        // make sure multi-partition implies no partitioning info
-        if (info.singlePartition == false) {
-            if ((info.partitionInfo != null) && (info.partitionInfo.length() > 0)) {
-                String msg = "Procedure: " + shortName + " is annotated as multi-partition";
-                msg += " but partitionInfo has non-empty value: \"" + info.partitionInfo + "\"";
-                throw compiler.new VoltCompilerException(msg);
+        boolean twoPartitionTxn = info.partitionInfo != null &&
+                info.partitionInfo.split(",").length > 1;
+
+        if (twoPartitionTxn) {
+            assert(info.singlePartition == false);
+        }
+        else {
+            // make sure multi-partition implies no partitoning info
+            if (info.singlePartition == false) {
+                if ((info.partitionInfo != null) && (info.partitionInfo.length() > 0)) {
+                    String msg = "Procedure: " + shortName + " is annotated as multi-partition";
+                    msg += " but partitionInfo has non-empty value: \"" + info.partitionInfo + "\"";
+                    throw compiler.new VoltCompilerException(msg);
+                }
             }
         }
 
@@ -471,7 +494,7 @@ public abstract class ProcedureCompiler {
                     throws VoltCompilerException {
         // parse the procedureInfo
         procedure.setSinglepartition(info.singlePartition);
-        if (!info.singlePartition) return;
+        if (info.isAllPartition()) return;
 
         parsePartitionInfo(compiler, db, procedure, info.partitionInfo);
         if (procedure.getPartitionparameter() >= paramTypes.length) {
@@ -596,10 +619,8 @@ public abstract class ProcedureCompiler {
 
         try {
             procClass.newInstance();
-        } catch (InstantiationException e) {
-            throw new RuntimeException("Error instantiating procedure \"" + procClass.getName() + "\"", e);
-        } catch (IllegalAccessException e) {
-            throw new RuntimeException("Error instantiating procedure \"" + procClass.getName() + "\"", e);
+        } catch (InstantiationException | IllegalAccessException e) {
+            throw new RuntimeException(String.format("Error instantiating procedure \"%s\"", procClass.getName()), e);
         }
 
         // find the run() method and get the params
@@ -758,6 +779,10 @@ public abstract class ProcedureCompiler {
             throw compiler.new VoltCompilerException("User procedure names can't contain \"@\".");
         }
 
+        // if there are multiple statements,
+        // all the statements are stored in m_singleStmt as a single string
+        String stmtsStr = procedureDescriptor.m_singleStmt;
+
         // get the short name of the class (no package if a user procedure)
         // use the Table.<builtin> name (allowing the period) if builtin.
         String shortName = className;
@@ -797,49 +822,70 @@ public abstract class ProcedureCompiler {
         }
         assert(info != null);
 
-        // ADD THE STATEMENT
+        String[] stmts = SQLLexer.splitStatements(stmtsStr).completelyParsedStmts.toArray(new String[0]);
 
-        // add the statement to the catalog
-        Statement catalogStmt = procedure.getStatements().add(VoltDB.ANON_STMT_NAME);
+        // ADD THE STATEMENTS in a loop
+        int stmtNum = 0;
+        // track if there are any writer statements and/or sequential scans and/or an overlooked common partitioning parameter
+        boolean procHasWriteStmts = false;
+        boolean procHasSeqScans = false;
 
-        // compile the statement
         StatementPartitioning partitioning =
-            info.singlePartition ? StatementPartitioning.forceSP() :
-                                   StatementPartitioning.forceMP();
-        // default to FASTER detmode because stmt procs can't feed read output into writes
-        StatementCompiler.compileFromSqlTextAndUpdateCatalog(compiler, hsql, db,
-                estimates, catalogStmt, procedureDescriptor.m_singleStmt,
-                procedureDescriptor.m_joinOrder, DeterminismMode.FASTER, partitioning);
+                info.singlePartition ? StatementPartitioning.forceSP() :
+                                       StatementPartitioning.forceMP();
 
-        // if the single stmt is not read only, then the proc is not read only
-        boolean procHasWriteStmts = (catalogStmt.getReadonly() == false);
+        for (String curStmt: stmts) {
+            // skip processing 'END' statement in multi statement procedures
+            if (curStmt.equalsIgnoreCase("end")) continue;
 
-        // set the read onlyness of a proc
-        procedure.setReadonly(procHasWriteStmts == false);
+            // add the statement to the catalog
+            Statement catalogStmt = procedure.getStatements().add(VoltDB.ANON_STMT_NAME + String.valueOf(stmtNum));
+            stmtNum++;
 
-        int seqs = catalogStmt.getSeqscancount();
-        procedure.setHasseqscans(seqs > 0);
+            // compile the statement
+            // default to FASTER detmode because stmt procs can't feed read output into writes
+            StatementCompiler.compileFromSqlTextAndUpdateCatalog(compiler, hsql, db,
+                    estimates, catalogStmt, curStmt,//procedureDescriptor.m_singleStmt,
+                    procedureDescriptor.m_joinOrder, DeterminismMode.FASTER, partitioning);
 
-        // set procedure parameter types
-        CatalogMap<ProcParameter> params = procedure.getParameters();
-        CatalogMap<StmtParameter> stmtParams = catalogStmt.getParameters();
+            // if a single stmt is not read only, then the proc is not read only
+            if (catalogStmt.getReadonly() == false) {
+                procHasWriteStmts = true;
+            }
 
-        // set the procedure parameter types from the statement parameter types
-        int paramCount = 0;
-        for (StmtParameter stmtParam : CatalogUtil.getSortedCatalogItems(stmtParams, "index")) {
-            // name each parameter "param1", "param2", etc...
-            ProcParameter procParam = params.add("param" + String.valueOf(paramCount));
-            procParam.setIndex(stmtParam.getIndex());
-            procParam.setIsarray(stmtParam.getIsarray());
-            procParam.setType(stmtParam.getJavatype());
-            paramCount++;
+            if (catalogStmt.getSeqscancount() > 0) {
+                procHasSeqScans = true;
+            }
+
+            // set procedure parameter types
+            CatalogMap<ProcParameter> params = procedure.getParameters();
+            CatalogMap<StmtParameter> stmtParams = catalogStmt.getParameters();
+
+            // set the procedure parameter types from the statement parameter types
+            int paramCount = params.size();
+            for (StmtParameter stmtParam : CatalogUtil.getSortedCatalogItems(stmtParams, "index")) {
+                // name each parameter "param1", "param2", etc...
+                ProcParameter procParam = params.add("param" + String.valueOf(paramCount));
+                procParam.setIndex(paramCount);
+                procParam.setIsarray(stmtParam.getIsarray());
+                procParam.setType(stmtParam.getJavatype());
+                paramCount++;
+            }
         }
+
+        if (stmtNum == 0) {
+            throw compiler.new VoltCompilerException("Cannot create a stored procedure with no statements "
+                    + "for procedure: " + procedure.getClassname());
+        }
+
+        int paramCount = procedure.getParameters().size();
+        boolean twoPartitionTxn = info.partitionInfo != null && info.partitionInfo.split(",").length > 1;
 
         // parse the procinfo
         procedure.setSinglepartition(info.singlePartition);
-        if (info.singlePartition) {
+        if (info.singlePartition || twoPartitionTxn) {
             parsePartitionInfo(compiler, db, procedure, info.partitionInfo);
-            if (procedure.getPartitionparameter() >= params.size()) {
+            if (procedure.getPartitionparameter() >= paramCount) {
                 String msg = "PartitionInfo parameter not a valid parameter for procedure: " + procedure.getClassname();
                 throw compiler.new VoltCompilerException(msg);
             }
@@ -883,24 +929,28 @@ public abstract class ProcedureCompiler {
                 }
             }
         }
+
+        // set the read onlyness of a proc
+        procedure.setReadonly(procHasWriteStmts == false);
+
+        procedure.setHasseqscans(procHasSeqScans);
     }
 
-    /**
-     * Determine which parameter is the partition indicator
-     */
-    public static void parsePartitionInfo(VoltCompiler compiler, Database db,
-            Procedure procedure, String info) throws VoltCompilerException {
+    static class ParititonSubClauseReturnType {
+        Table partitionTable = null;
+        Column partitionColumn = null;
+        int partitionParamIndex = -1;
+    }
 
-        assert(procedure.getSinglepartition() == true);
-
-        // check this isn't empty
-        if (info.length() == 0) {
-            String msg = "Missing or Truncated PartitionInfo in attribute for procedure: " + procedure.getClassname();
-            throw compiler.new VoltCompilerException(msg);
-        }
+    static ParititonSubClauseReturnType processPartitionSubClause(VoltCompiler compiler,
+                                                                  Database db,
+                                                                  Procedure procedure,
+                                                                  String subClause,
+                                                                  String info) throws VoltCompilerException {
+        ParititonSubClauseReturnType retval = new ParititonSubClauseReturnType();
 
         // split on the colon
-        String[] parts = info.split(":");
+        String[] parts = subClause.split(":");
 
         // if the colon doesn't split well, we have a problem
         if (parts.length != 2) {
@@ -919,7 +969,7 @@ public abstract class ProcedureCompiler {
         }
 
         // locate the parameter
-        procedure.setPartitionparameter(paramIndex);
+        retval.partitionParamIndex = paramIndex;
 
         // split the columninfo
         parts = columnInfo.split("\\.");
@@ -947,9 +997,9 @@ public abstract class ProcedureCompiler {
                 for (Column column : columns) {
                     if (column.getTypeName().equalsIgnoreCase(columnName)) {
                         if (partitionColumn.getTypeName().equals(column.getTypeName())) {
-                            procedure.setPartitioncolumn(column);
-                            procedure.setPartitiontable(table);
-                            return;
+                            retval.partitionColumn = column;
+                            retval.partitionTable = table;
+                            return retval;
                         }
                         else {
                             String msg = "PartitionInfo for procedure " + procedure.getClassname() + " refers to a column in schema which is not a partition key.";
@@ -962,5 +1012,36 @@ public abstract class ProcedureCompiler {
 
         String msg = "PartitionInfo for procedure " + procedure.getClassname() + " refers to a column in schema which can't be found.";
         throw compiler.new VoltCompilerException(msg);
+    }
+
+    /**
+     * Determine which parameter is the partition indicator
+     */
+    public static void parsePartitionInfo(VoltCompiler compiler, Database db,
+            Procedure procedure, String info) throws VoltCompilerException {
+
+        // check this isn't empty
+        if (info.length() == 0) {
+            String msg = "Missing or Truncated PartitionInfo in attribute for procedure: " + procedure.getClassname();
+            throw compiler.new VoltCompilerException(msg);
+        }
+
+        // split on the comma for two-partition procs
+        String[] partitionClauses = info.split(",");
+        assert(partitionClauses.length >= 1);
+
+        ParititonSubClauseReturnType partitionClauseData = processPartitionSubClause(compiler, db, procedure, partitionClauses[0], info);
+        procedure.setPartitionparameter(partitionClauseData.partitionParamIndex);
+        procedure.setPartitioncolumn(partitionClauseData.partitionColumn);
+        procedure.setPartitiontable(partitionClauseData.partitionTable);
+
+        // handle a two partition proc
+        if (partitionClauses.length > 1) {
+            partitionClauseData = processPartitionSubClause(compiler, db, procedure, partitionClauses[1], info);
+            procedure.setPartitionparameter2(partitionClauseData.partitionParamIndex);
+            procedure.setPartitioncolumn2(partitionClauseData.partitionColumn);
+            procedure.setPartitiontable2(partitionClauseData.partitionTable);
+            procedure.setSinglepartition(false);
+        }
     }
 }

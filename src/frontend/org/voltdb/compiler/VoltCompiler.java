@@ -85,7 +85,6 @@ import org.xml.sax.SAXException;
 import org.xml.sax.SAXParseException;
 
 import com.google_voltpatches.common.collect.ImmutableList;
-import com.google_voltpatches.common.collect.ImmutableSet;
 
 /**
  * Compiles a project XML file and some metadata into a Jarfile
@@ -137,7 +136,6 @@ public class VoltCompiler {
     private String m_currentFilename = NO_FILENAME;
     Map<String, String> m_ddlFilePaths = new HashMap<>();
     String[] m_addedClasses = null;
-    Set<String> m_importLines = null;
 
     // generated html text for catalog report
     String m_reportPath = null;
@@ -714,7 +712,7 @@ public class VoltCompiler {
         assert(database != null);
 
         // Build DDL from Catalog Data
-        String ddlWithBatchSupport = CatalogSchemaTools.toSchema(catalog, m_importLines);
+        String ddlWithBatchSupport = CatalogSchemaTools.toSchema(catalog);
         m_canonicalDDL = CatalogSchemaTools.toSchemaWithoutInlineBatches(ddlWithBatchSupport);
 
         // generate the catalog report and write it to disk
@@ -1058,9 +1056,6 @@ public class VoltCompiler {
 
         // add extra classes from the DDL
         m_addedClasses = voltDdlTracker.m_extraClassses.toArray(new String[0]);
-        // Also, grab the IMPORT CLASS lines so we can add them to the
-        // generated DDL
-        m_importLines = ImmutableSet.copyOf(voltDdlTracker.m_importLines);
         addExtraClasses(jarOutput);
 
         compileRowLimitDeleteStmts(db, hsql, ddlcompiler.getLimitDeleteStmtToXmlEntries());
@@ -2017,12 +2012,18 @@ public class VoltCompiler {
             Entry<String, byte[]> entry = outputJar.firstEntry();
             while (entry != null) {
                 String path = entry.getKey();
-                //TODO: It would be better to have a manifest that explicitly lists
-                // ddl files instead of using a brute force *.sql glob.
-                if (path.toLowerCase().endsWith(".sql")) {
+                // ENG-12980: only look for auto-gen.ddl on root directory
+                if (AUTOGEN_DDL_FILE_NAME.equalsIgnoreCase(path)) {
                     ddlReaderList.add(new VoltCompilerJarFileReader(outputJar, path));
+                    break;
                 }
                 entry = outputJar.higherEntry(entry.getKey());
+            }
+
+            if (ddlReaderList.size() == 0) {
+                // did not find auto generated DDL file during upgrade
+                throw new IOException("Could not find " + AUTOGEN_DDL_FILE_NAME + " in the catalog "
+                        + "compiled by VoltDB " + versionFromCatalog);
             }
 
             // Use the in-memory jarfile-provided class loader so that procedure
