@@ -28,7 +28,7 @@
 
 
 Flask==0.10.1
-requests==2.8.1
+requests==2.20.0
 Flask-Inputs==0.2.0
 WTForms== 2.0.2
 jsonschema==2.5.1
